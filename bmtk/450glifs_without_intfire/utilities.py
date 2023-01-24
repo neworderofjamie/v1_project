@@ -109,7 +109,11 @@ def get_dynamics_params(
     asc_decay_rates = np.exp(-asc_decay * sim_config["run"]["dt"])
     asc_stable_coeff = (1.0 / asc_decay / DT) * (1.0 - asc_decay_rates)
     asc_refractory_decay_rates = r * np.exp(-asc_decay * t_ref)
-
+    
+    assert len(old_dynamics_params["asc_init"]) == 2
+    assert len(old_dynamics_params["asc_amps"]) == 2
+    assert len(asc_refractory_decay_rates) == 2
+    
     dynamics_params_renamed = {
         "C": old_dynamics_params["C_m"] / 1000,  # pF -> nF
         "G": old_dynamics_params["g"] / 1000,  # nS -> uS
@@ -133,7 +137,7 @@ def get_dynamics_params(
         "asc_decay_rates_2": asc_decay_rates[1],
         "asc_refractory_decay_rates_1": asc_refractory_decay_rates[0],
         "asc_refractory_decay_rates_2": asc_refractory_decay_rates[1],
-        "tau": old_dynamics_params["tau_syn"][0],
+        "tau_syn": old_dynamics_params["tau_syn"],
     }
 
     return dynamics_params_renamed, num_neurons
@@ -182,141 +186,64 @@ def construct_synapses(
     syn_dict,
     pop1,
     pop2,
-    all_edge_type_ids,
-    all_nsyns,
-    edge_df,
+    dynamics_base_dir,
+    edges,
+    edge_type_id,
     syn_df,
     sim_config,
     dynamics_params,
 ):
-    for edge_type_id in all_edge_type_ids:
-        for nsyns in all_nsyns:
+    # **TODO** all of this could be done per edge type rather than per synapse pop
+    # Open dynamics file used by this edge type
+    synaptic_dynamics_file = syn_df[syn_df["edge_type_id"] == edge_type_id][
+        "dynamics_params"
+    ].iloc[0]
+    
+    synaptic_dynamics_path = Path(dynamics_base_dir, synaptic_dynamics_file)
+    with open(synaptic_dynamics_path) as f:
+        synaptic_dynamics_params = json.load(f)
+        
+    # Get delay and weight specific to the edge_type_id
+    delay_steps = round(
+        syn_df[syn_df["edge_type_id"] == edge_type_id]["delay"].iloc[0]
+        / sim_config["run"]["dt"]
+    )  # delay (ms) -> delay (steps)
+    weight = (
+        syn_df[syn_df["edge_type_id"] == edge_type_id]["syn_weight"].iloc[0]
+        / 1e3
+    )  # nS -> uS; multiply by number of synapses
+    
+    tau_syn = dynamics_params["tau_syn"][synaptic_dynamics_params["receptor_type"] - 1]
+    
+    s_ini = {"g": weight}
+    psc_Alpha_params = {"tau": tau_syn}
+    psc_Alpha_init = {"x": 0.0}
 
-            # Filter by source, target, edge_type_id, and nsyns
-            src = edge_df[~edge_df["source_" + pop1].isnull()]
-            src_tgt = src[~src["target_" + pop2].isnull()]
-            src_tgt_id = src_tgt[src_tgt["edge_type_id"] == edge_type_id]
-            src_tgt_id_nsyns = src_tgt_id[src_tgt_id["nsyns"] == nsyns]
+    synapse_group_name = f"{pop1}_{pop2}_{edge_type_id}"
 
-            # Convert to list for GeNN
-            s_list = src_tgt_id_nsyns["source_" + pop1].tolist()
-            t_list = src_tgt_id_nsyns["target_" + pop2].tolist()
+    syn_dict[synapse_group_name] = model.add_synapse_population(
+        pop_name=synapse_group_name,
+        matrix_type="SPARSE_GLOBALG_INDIVIDUAL_PSM",
+        delay_steps=delay_steps,
+        source=pop1,
+        target=pop2,
+        w_update_model="StaticPulse",
+        wu_param_space={},
+        wu_var_space=s_ini,
+        wu_pre_var_space={},
+        wu_post_var_space={},
+        postsyn_model=psc_Alpha,
+        ps_param_space=psc_Alpha_params,
+        ps_var_space=psc_Alpha_init,
+    )
 
-            # Skip if no synapses (typically only 1 edge_type_id relevant for each source)
-            if len(s_list) == 0:
-                # print(
-                #     "No synapses found for {} -> {} with edge type id={}".format(
-                #         pop1,
-                #         pop2,
-                #         edge_type_id,
-                #     )
-                # )
-                continue
+    # **TODO** no reason not to have edges in this order and as sensible numpy type already
+    edges = list(zip(*edges))
+    syn_dict[synapse_group_name].set_sparse_connections(
+        np.asarray(edges[0], dtype=np.int64), np.asarray(edges[1], dtype=np.int64)
+    )
+    print(
+        f"Synapses added for {pop1} -> {pop2} with edge type id={edge_type_id}"
+    )
 
-            # Test correct assignment
-            assert np.all(~src_tgt_id_nsyns.isnull(), axis=0).sum() == 6
-
-            # Get delay and weight specific to the edge_type_id
-            delay_steps = round(
-                syn_df[syn_df["edge_type_id"] == edge_type_id]["delay"].iloc[0]
-                / sim_config["run"]["dt"]
-            )  # delay (ms) -> delay (steps)
-            weight = (
-                syn_df[syn_df["edge_type_id"] == edge_type_id]["syn_weight"].iloc[0]
-                / 1e3
-                * nsyns
-            )  # nS -> uS; multiply by number of synapses
-
-            s_ini = {"g": weight}
-            psc_Alpha_params = {"tau": dynamics_params["tau"]}  # TODO: Always 0th port?
-            psc_Alpha_init = {"x": 0.0}
-
-            synapse_group_name = pop1 + "_to_" + pop2 + "_nsyns_" + str(nsyns)
-            syn_dict[synapse_group_name] = model.add_synapse_population(
-                pop_name=synapse_group_name,
-                matrix_type="SPARSE_GLOBALG_INDIVIDUAL_PSM",
-                delay_steps=delay_steps,
-                source=pop1,
-                target=pop2,
-                w_update_model="StaticPulse",
-                wu_param_space={},
-                wu_var_space=s_ini,
-                wu_pre_var_space={},
-                wu_post_var_space={},
-                postsyn_model=psc_Alpha,
-                ps_param_space=psc_Alpha_params,
-                ps_var_space=psc_Alpha_init,
-            )
-            syn_dict[synapse_group_name].set_sparse_connections(
-                np.array(s_list), np.array(t_list)
-            )
-            print(
-                "Synapses added for {} -> {} with edge type id={} and nsyns={}".format(
-                    pop1, pop2, edge_type_id, nsyns
-                )
-            )
     return syn_dict
-
-
-def construct_id_conversion_df(
-    edges,
-    all_model_names,
-    source_node_to_pop_idx_dict,
-    target_node_to_pop_idx_dict,
-    filename,
-):
-
-    # Load pickle if already constructed
-    if Path(filename).exists():
-        with open(filename, "rb") as f:
-            v1_edge_df = pickle.load(f)
-        print("Loaded previously constructed id conversion df.")
-    else:
-        num_edges = len(edges)
-        edges_for_df = []
-        for i, e in enumerate(edges):
-
-            # Print status
-            if i % 1000 == 0:
-                print(
-                    "Constructing id conversion df: {}%".format(
-                        np.round(i / num_edges * 100)
-                    ),
-                    end="\r",
-                )
-
-            e_dict = {}
-
-            # Add node_ids
-            e_dict["source_node_id"] = e.source_node_id
-            e_dict["target_node_id"] = e.target_node_id
-
-            # Populate empty indices for each population
-            for m in all_model_names:
-                e_dict["source_" + m] = pd.NA
-                e_dict["target_" + m] = pd.NA
-
-            # Populate actual dicts
-            [m_name, idx] = source_node_to_pop_idx_dict[e.source_node_id]
-            e_dict["source_" + m_name] = idx
-
-            [m_name, idx] = target_node_to_pop_idx_dict[e.target_node_id]
-            e_dict["target_" + m_name] = idx
-
-            # Add edge type id, which is used to get correct synaptic weight/delay
-            # TODO: Is dynamics_params e.g. e2i.json used?
-            e_dict["edge_type_id"] = e.edge_type_id
-
-            # Add number of synapses
-            e_dict["nsyns"] = e["nsyns"]
-
-            edges_for_df.append(e_dict)
-        v1_edge_df = pd.DataFrame(edges_for_df)
-
-        # Save as pickle file
-        if filename.parent.exists() == False:
-            Path.mkdir(filename.parent, parents=True)
-        with open(filename, "wb") as f:
-            pickle.dump(v1_edge_df, f)
-
-    return v1_edge_df
